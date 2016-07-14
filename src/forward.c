@@ -31,71 +31,6 @@ static int send_check_sign(struct frec *forward, time_t now, struct dns_header *
 			   char *name, char *keyname);
 #endif
 
-#ifdef FUZZ
-ssize_t my_recvmsg(int sockfd, struct msghdr *msg, int flags)
-{
-  ssize_t n;
-  ssize_t i;
-  char a, b;
-
-  if(daemon->client_fuzz_file)
-  {
-    printf("Fuzzy!\n");
-    FILE *f = fopen(daemon->client_fuzz_file, "rb");
-    if(!f)
-    {
-      printf("Couldn't open file: %s\n", daemon->client_fuzz_file);
-      exit(1);
-    }
-
-    n = fread((char*)msg->msg_iov->iov_base, 1, msg->msg_iov->iov_len, f);
-    fclose(f);
-
-    /* Replace the transaction_id. */
-    ((char*)msg->msg_iov->iov_base)[0] = a;
-    ((char*)msg->msg_iov->iov_base)[1] = b;
-
-    memcpy(msg->msg_name, "\x0a\x00\x41\x41\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00", 28);
-    msg->msg_namelen    = 28;
-    memcpy(msg->msg_control, "\x24\x00\x00\x00\x00\x00\x00\x00\x29\x00\x00\x00\x32\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00", 40);
-    msg->msg_controllen = 40;
-    msg->msg_flags      = 0;
-  }
-  else
-  {
-    n = recvmsg(sockfd, msg, flags);
-  }
-
-  return n;
-}
-
-ssize_t my_recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen)
-{
-  ssize_t n;
-
-  if(daemon->server_fuzz_file)
-  {
-    printf("Fuzzy!\n");
-
-    FILE *f = fopen(daemon->server_fuzz_file, "rb");
-    if(!f)
-    {
-      printf("Couldn't open file: %s\n", daemon->server_fuzz_file);
-      exit(1);
-    }
-
-    n = fread((char*)buf, 1, len, f);
-    fclose(f);
-  }
-  else
-  {
-    n = recvfrom(sockfd, buf, len, flags, src_addr, addrlen);
-  }
-
-  return n;
-}
-
-#endif
 
 /* Send a UDP packet with its source address set as "source" 
    unless nowild is true, when we just send it with the kernel default */
@@ -318,6 +253,7 @@ static int forward_query(int udpfd, union mysockaddr *udpaddr,
   void *hash = &crc;
 #endif
  unsigned int gotname = extract_request(header, plen, daemon->namebuff, NULL);
+ unsigned char *pheader;
 
  (void)do_bit;
 
@@ -326,19 +262,32 @@ static int forward_query(int udpfd, union mysockaddr *udpaddr,
     forward = NULL;
   else if (forward || (hash && (forward = lookup_frec_by_sender(ntohs(header->id), udpaddr, hash))))
     {
+      /* If we didn't get an answer advertising a maximal packet in EDNS,
+	 fall back to 1280, which should work everywhere on IPv6.
+	 If that generates an answer, it will become the new default
+	 for this server */
+      forward->flags |= FREC_TEST_PKTSZ;
+      
 #ifdef HAVE_DNSSEC
       /* If we've already got an answer to this query, but we're awaiting keys for validation,
 	 there's no point retrying the query, retry the key query instead...... */
       if (forward->blocking_query)
 	{
 	  int fd;
-
+	  
+	  forward->flags &= ~FREC_TEST_PKTSZ;
+	  
 	  while (forward->blocking_query)
 	    forward = forward->blocking_query;
+	   
+	  forward->flags |= FREC_TEST_PKTSZ;
 	  
 	  blockdata_retrieve(forward->stash, forward->stash_len, (void *)header);
 	  plen = forward->stash_len;
 	  
+	  if (find_pseudoheader(header, plen, NULL, &pheader, NULL))
+	    PUTSHORT((forward->flags & FREC_TEST_PKTSZ) ? SAFE_PKTSZ : forward->sentto->edns_pktsz, pheader);
+
 	  if (forward->sentto->addr.sa.sa_family == AF_INET) 
 	    log_query(F_NOEXTRA | F_DNSSEC | F_IPV4, "retry", (struct all_addr *)&forward->sentto->addr.in.sin_addr, "dnssec");
 #ifdef HAVE_IPV6
@@ -482,7 +431,7 @@ static int forward_query(int udpfd, union mysockaddr *udpaddr,
 	  plen = new_plen;
 	}
 #endif
-
+      
       while (1)
 	{ 
 	  /* only send to servers dealing with our domain.
@@ -529,6 +478,9 @@ static int forward_query(int udpfd, union mysockaddr *udpaddr,
 		    }
 #endif
 		}
+
+	      if (find_pseudoheader(header, plen, NULL, &pheader, NULL))
+		PUTSHORT((forward->flags & FREC_TEST_PKTSZ) ? SAFE_PKTSZ : start->edns_pktsz, pheader);
 	      
 	      if (retry_send(sendto(fd, (char *)header, plen, 0,
 				    &start->addr.sa,
@@ -748,11 +700,7 @@ void reply_query(int fd, int family, time_t now)
   union mysockaddr serveraddr;
   struct frec *forward;
   socklen_t addrlen = sizeof(serveraddr);
-#if FUZZ
-  ssize_t n = my_recvfrom(fd, daemon->packet, daemon->packet_buff_sz, 0, &serveraddr.sa, &addrlen);
-#else
   ssize_t n = recvfrom(fd, daemon->packet, daemon->packet_buff_sz, 0, &serveraddr.sa, &addrlen);
-#endif
   size_t nn;
   struct server *server;
   void *hash;
@@ -776,41 +724,24 @@ void reply_query(int fd, int family, time_t now)
     return;
   
   /* spoof check: answer must come from known server, */
-#ifdef FUZZ
-  if(!daemon->server_fuzz_file)
-  {
-#endif
-    for (server = daemon->servers; server; server = server->next)
-      if (!(server->flags & (SERV_LITERAL_ADDRESS | SERV_NO_ADDR)) &&
-	  sockaddr_isequal(&server->addr, &serveraddr))
-        break;
-
-    if (!server)
-      return;
-#ifdef FUZZ
-  }
-#endif
-
+  for (server = daemon->servers; server; server = server->next)
+    if (!(server->flags & (SERV_LITERAL_ADDRESS | SERV_NO_ADDR)) &&
+	sockaddr_isequal(&server->addr, &serveraddr))
+      break;
+  
+  if (!server)
+    return;
+  
 #ifdef HAVE_DNSSEC
   hash = hash_questions(header, n, daemon->namebuff);
 #else
   hash = &crc;
   crc = questions_crc(header, n, daemon->namebuff);
 #endif
-
-#ifdef FUZZ
-  if(daemon->server_fuzz_file)
-  {
-    struct frec *my_frec = (struct frec*)malloc(sizeof(struct frec));
-    my_frec->sentto = (struct server*)malloc(sizeof(struct server));
-
-    forward = my_frec;
-  }
-  else
-#endif
-    if (!(forward = lookup_frec(ntohs(header->id), hash)))
-      return;
-
+  
+  if (!(forward = lookup_frec(ntohs(header->id), hash)))
+    return;
+  
   /* log_query gets called indirectly all over the place, so 
      pass these in global variables - sorry. */
   daemon->log_display_id = forward->log_id;
@@ -838,7 +769,8 @@ void reply_query(int fd, int family, time_t now)
 	  header->arcount = htons(0);
 	  if ((nn = resize_packet(header, (size_t)n, pheader, plen)))
 	    {
-	      header->hb3 &= ~(HB3_QR | HB3_TC);
+	      header->hb3 &= ~(HB3_QR | HB3_AA | HB3_TC);
+	      header->hb4 &= ~(HB4_RA | HB4_RCODE);
 	      forward_query(-1, NULL, NULL, 0, header, nn, now, forward, 0, 0);
 	      return;
 	    }
@@ -846,7 +778,6 @@ void reply_query(int fd, int family, time_t now)
     }   
    
   server = forward->sentto;
-  
   if ((forward->sentto->flags & SERV_TYPE) == 0)
     {
       if (RCODE(header) == REFUSED)
@@ -867,7 +798,14 @@ void reply_query(int fd, int family, time_t now)
       if (!option_bool(OPT_ALL_SERVERS))
 	daemon->last_server = server;
     }
-
+ 
+  /* We tried resending to this server with a smaller maximum size and got an answer.
+     Make that permanent. To avoid reduxing the packet size for an single dropped packet,
+     only do this when we get a truncated answer, or one larger than the safe size. */
+  if (server && (forward->flags & FREC_TEST_PKTSZ) && 
+      ((header->hb3 & HB3_TC) || n >= SAFE_PKTSZ))
+    server->edns_pktsz = SAFE_PKTSZ;
+  
   /* If the answer is an error, keep the forward record in place in case
      we get a good reply from another server. Kill it when we've
      had replies from all to avoid filling the forwarding table when
@@ -913,7 +851,7 @@ void reply_query(int fd, int family, time_t now)
 		   Avoid caching a reply with sigs if there's a vaildated break in the 
 		   DS chain, so we don't return replies from cache missing sigs. */
 		status = STAT_INSECURE_DS;
-	      else if (status == STAT_NO_NS)
+	      else if (status == STAT_NO_NS || status == STAT_NO_SIG)
 		status = STAT_BOGUS;
 	    }
 	  else if (forward->flags & FREC_CHECK_NOSIGN)
@@ -976,7 +914,7 @@ void reply_query(int fd, int family, time_t now)
 		    {
 		      new->flags |= FREC_DNSKEY_QUERY; 
 		      nn = dnssec_generate_query(header, ((char *) header) + daemon->packet_buff_sz,
-						 daemon->keyname, forward->class, T_DNSKEY, &server->addr);
+						 daemon->keyname, forward->class, T_DNSKEY, &server->addr, server->edns_pktsz);
 		    }
 		  else 
 		    {
@@ -985,7 +923,7 @@ void reply_query(int fd, int family, time_t now)
 		      else
 			new->flags |= FREC_DS_QUERY;
 		      nn = dnssec_generate_query(header,((char *) header) + daemon->packet_buff_sz,
-						 daemon->keyname, forward->class, T_DS, &server->addr);
+						 daemon->keyname, forward->class, T_DS, &server->addr, server->edns_pktsz);
 		    }
 		  if ((hash = hash_questions(header, nn, daemon->namebuff)))
 		    memcpy(new->hash, hash, HASH_SIZE);
@@ -1059,7 +997,7 @@ void reply_query(int fd, int family, time_t now)
 			   Avoid caching a reply with sigs if there's a vaildated break in the 
 			   DS chain, so we don't return replies from cache missing sigs. */
 			status = STAT_INSECURE_DS;
-		      else if (status == STAT_NO_NS)
+		      else if (status == STAT_NO_NS || status == STAT_NO_SIG)
 			status = STAT_BOGUS; 
 		    }
 		  else if (forward->flags & FREC_CHECK_NOSIGN)
@@ -1211,15 +1149,10 @@ void receive_query(struct listener *listen, time_t now)
   msg.msg_namelen = sizeof(source_addr);
   msg.msg_iov = iov;
   msg.msg_iovlen = 1;
-
-#ifdef FUZZ
-  if ((n = my_recvmsg(listen->fd, &msg, 0)) == -1)
-    return;
-#else
+  
   if ((n = recvmsg(listen->fd, &msg, 0)) == -1)
     return;
-#endif
-
+  
   if (n < (int)sizeof(struct dns_header) || 
       (msg.msg_flags & MSG_TRUNC) ||
       (header->hb3 & HB3_QR))
@@ -1279,12 +1212,8 @@ void receive_query(struct listener *listen, time_t now)
 	  return;
 	}
     }
-
-#ifdef FUZZ
-  if (check_dst && daemon->client_fuzz_file == 0)
-#else
+		
   if (check_dst)
-#endif
     {
       struct ifreq ifr;
 
@@ -1527,6 +1456,21 @@ static int do_check_sign(struct frec *forward, int status, time_t now, char *nam
       if (status == STAT_BOGUS)
 	return STAT_BOGUS;
 
+      if (status == STAT_NO_SIG && *keyname != 0)
+	{
+	  /* There is a validated CNAME chain that doesn't end in a DS record. Start 
+	     the search again in that domain. */
+	  blockdata_free(forward->orig_domain);
+	  forward->name_start = strlen(keyname);
+	  forward->name_len = forward->name_start + 1;
+	  if (!(forward->orig_domain = blockdata_alloc(keyname, forward->name_len)))
+	    return STAT_BOGUS;
+	  
+	  strcpy(name, keyname);
+	  status = 0; /* force to cache when we iterate. */
+	  continue;
+	}
+      
       /* There's a proven DS record, or we're within a zone, where there doesn't need
 	 to be a DS record. Add a name and try again. 
 	 If we've already tried the whole name, then fail */
@@ -1621,7 +1565,7 @@ static int  tcp_check_for_unsigned_zone(time_t now, struct dns_header *header, s
       
       /* Can't find it in the cache, have to send a query */
 
-      m = dnssec_generate_query(header, ((char *) header) + 65536, name_start, class, T_DS, &server->addr);
+      m = dnssec_generate_query(header, ((char *) header) + 65536, name_start, class, T_DS, &server->addr, server->edns_pktsz);
       
       *length = htons(m);
       
@@ -1641,6 +1585,21 @@ static int  tcp_check_for_unsigned_zone(time_t now, struct dns_header *header, s
 	      free(packet);
 	      blockdata_free(block);
 	      return STAT_INSECURE;
+	    }
+	  
+	  if (status == STAT_NO_SIG && *keyname != 0)
+	    {
+	      /* There is a validated CNAME chain that doesn't end in a DS record. Start 
+		 the search again in that domain. */
+	      blockdata_free(block);
+	      name_len = strlen(keyname) + 1;
+	      name_start = name + name_len - 1;
+	      
+	      if (!(block = blockdata_alloc(keyname, name_len)))
+		return STAT_BOGUS;
+	      
+	      strcpy(name, keyname);
+	      continue;
 	    }
 	  
 	  if (status == STAT_BOGUS)
@@ -1698,7 +1657,7 @@ static int tcp_key_recurse(time_t now, int status, struct dns_header *header, si
 	{
 	  if (new_status == STAT_NO_DS)
 	    new_status = STAT_INSECURE_DS;
-	  else if (new_status == STAT_NO_NS)
+	  else if (new_status == STAT_NO_NS || new_status == STAT_NO_SIG)
 	    new_status = STAT_BOGUS;
 	}
     }
@@ -1733,7 +1692,7 @@ static int tcp_key_recurse(time_t now, int status, struct dns_header *header, si
 
     another_tcp_key:
       m = dnssec_generate_query(new_header, ((char *) new_header) + 65536, keyname, class, 
-				new_status == STAT_NEED_KEY ? T_DNSKEY : T_DS, &server->addr);
+				new_status == STAT_NEED_KEY ? T_DNSKEY : T_DS, &server->addr, server->edns_pktsz);
       
       *length = htons(m);
       
@@ -1763,7 +1722,7 @@ static int tcp_key_recurse(time_t now, int status, struct dns_header *header, si
 		    {
 		      if (new_status == STAT_NO_DS)
 			new_status = STAT_INSECURE_DS;
-		      else if (new_status == STAT_NO_NS)
+		      else if (new_status == STAT_NO_NS || new_status == STAT_NO_SIG)
 			new_status = STAT_BOGUS; /* Validated no DS */
 		    }
 		}
@@ -1824,12 +1783,9 @@ unsigned char *tcp_request(int confd, time_t now,
   socklen_t peer_len = sizeof(union mysockaddr);
   int query_count = 0;
 
-#if FUZZ
-  if (!daemon->tcp_client_fuzz_file)
-#endif
-    if (getpeername(confd, (struct sockaddr *)&peer_addr, &peer_len) == -1)
-      return packet;
-
+  if (getpeername(confd, (struct sockaddr *)&peer_addr, &peer_len) == -1)
+    return packet;
+  
   /* We can be configured to only accept queries from at-most-one-hop-away addresses. */
   if (option_bool(OPT_LOCAL_SERVICE))
     {

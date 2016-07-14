@@ -18,40 +18,6 @@
 
 #ifdef HAVE_DHCP
 
-#ifdef FUZZ
-static ssize_t my_recvmsg(int sockfd, struct msghdr *msg, int flags)
-{
-  ssize_t n;
-  ssize_t i;
-
-  if(daemon->dhcp_fuzz_file)
-  {
-    printf("Fuzzy!\n");
-    FILE *f = fopen(daemon->dhcp_fuzz_file, "rb");
-    if(!f)
-    {
-      printf("Couldn't open file: %s\n", daemon->dhcp_fuzz_file);
-      exit(1);
-    }
-
-    n = fread((char*)msg->msg_iov->iov_base, 1, msg->msg_iov->iov_len, f);
-    fclose(f);
-
-    memcpy(msg->msg_name, "\x0a\x00\x41\x41\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00", 28);
-    msg->msg_namelen    = 28;
-    memcpy(msg->msg_control, "\x24\x00\x00\x00\x00\x00\x00\x00\x29\x00\x00\x00\x32\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00", 40);
-    msg->msg_controllen = 40;
-    msg->msg_flags      = 0;
-  }
-  else
-  {
-    n = recvmsg(sockfd, msg, flags);
-  }
-
-  return n;
-}
-#endif
-
 void dhcp_common_init(void)
 {
     /* These each hold a DHCP option max size 255
@@ -77,12 +43,8 @@ ssize_t recv_dhcp_packet(int fd, struct msghdr *msg)
   while (1)
     {
       msg->msg_flags = 0;
-#if FUZZ
-      while ((sz = my_recvmsg(fd, msg, MSG_PEEK | MSG_TRUNC)) == -1 && errno == EINTR);
-#else
       while ((sz = recvmsg(fd, msg, MSG_PEEK | MSG_TRUNC)) == -1 && errno == EINTR);
-#endif
-
+      
       if (sz == -1)
 	return -1;
       
@@ -103,11 +65,7 @@ ssize_t recv_dhcp_packet(int fd, struct msghdr *msg)
 	}
     }
   
-#if FUZZ
-  while ((sz = my_recvmsg(fd, msg, 0)) == -1 && errno == EINTR);
-#else
   while ((sz = recvmsg(fd, msg, 0)) == -1 && errno == EINTR);
-#endif
   
   return (msg->msg_flags & MSG_TRUNC) ? -1 : sz;
 }
@@ -587,8 +545,8 @@ static const struct opttab_t {
   { "parameter-request", 55, OT_INTERNAL },
   { "message", 56, OT_INTERNAL },
   { "max-message-size", 57, OT_INTERNAL },
-  { "T1", 58, OT_INTERNAL | OT_TIME},
-  { "T2", 59, OT_INTERNAL | OT_TIME},
+  { "T1", 58, OT_TIME},
+  { "T2", 59, OT_TIME},
   { "vendor-class", 60, 0 },
   { "client-id", 61, OT_INTERNAL },
   { "nis+-domain", 64, OT_NAME },

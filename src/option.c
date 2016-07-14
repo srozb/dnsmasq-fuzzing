@@ -154,16 +154,6 @@ struct myoption {
 #define LOPT_HOST_INOTIFY  342
 #define LOPT_DNSSEC_STAMP  343
 #define LOPT_TFTP_NO_FAIL  344
-#ifdef FUZZ
-#define LOPT_FUZZ_CLIENT   345
-#define LOPT_FUZZ_SERVER   346
-#define LOPT_RANDOM_PORT   347
-#define LOPT_TCP_FUZZ_CLIENT 348
-#define LOPT_TCP_FUZZ_SERVER 349
-#define LOPT_TFTP_FUZZ     350
-#define LOPT_DHCP_FUZZ     351
-#define LOPT_DHCP6_FUZZ    352
-#endif
 
 #ifdef HAVE_GETOPT_LONG
 static const struct option opts[] =  
@@ -323,16 +313,6 @@ static const struct myoption opts[] =
     { "quiet-dhcp6", 0, 0, LOPT_QUIET_DHCP6 },
     { "quiet-ra", 0, 0, LOPT_QUIET_RA },
     { "dns-loop-detect", 0, 0, LOPT_LOOP_DETECT },
-#ifdef FUZZ
-    { "client-fuzz", 1, 0, LOPT_FUZZ_CLIENT },
-    { "server-fuzz", 1, 0, LOPT_FUZZ_SERVER },
-    { "randomize-port", 0, 0, LOPT_RANDOM_PORT },
-    { "tcp-client-fuzz", 1, 0, LOPT_TCP_FUZZ_CLIENT },
-    { "tcp-server-fuzz", 1, 0, LOPT_TCP_FUZZ_SERVER },
-    { "tftp-fuzz", 1, 0, LOPT_TFTP_FUZZ },
-    { "dhcp-fuzz", 1, 0, LOPT_DHCP_FUZZ },
-    { "dhcp6-fuzz", 1, 0, LOPT_DHCP6_FUZZ },
-#endif
     { NULL, 0, 0, 0 }
   };
 
@@ -499,16 +479,6 @@ static struct {
   { LOPT_LOCAL_SERVICE, OPT_LOCAL_SERVICE, NULL, gettext_noop("Accept queries only from directly-connected networks"), NULL },
   { LOPT_LOOP_DETECT, OPT_LOOP_DETECT, NULL, gettext_noop("Detect and remove DNS forwarding loops"), NULL },
   { LOPT_IGNORE_ADDR, ARG_DUP, "<ipaddr>", gettext_noop("Ignore DNS responses containing ipaddr."), NULL }, 
-#ifdef FUZZ
-  { LOPT_FUZZ_CLIENT, ARG_DUP, "<filename>", gettext_noop("Read DNS requests from the given file instead of the network."), NULL },
-  { LOPT_FUZZ_SERVER, ARG_DUP, "<filename>", gettext_noop("Read DNS responses from the given file instead of the network."), NULL },
-  { LOPT_RANDOM_PORT, ARG_DUP, NULL, gettext_noop("Randomize the listen port (useful for fuzzing)"), NULL },
-  { LOPT_TCP_FUZZ_CLIENT, ARG_DUP, "<filename>", gettext_noop("Read TCP DNS requests from the given file instead of the network."), NULL },
-  { LOPT_TCP_FUZZ_SERVER, ARG_DUP, "<filename>", gettext_noop("Read TCP DNS responses from the given file instead of the network."), NULL },
-  { LOPT_TFTP_FUZZ, ARG_DUP, "<filename>", gettext_noop("Read and parses a TFTP packet from a file instead of the network."), NULL },
-  { LOPT_DHCP_FUZZ, ARG_DUP, "<filename>", gettext_noop("Read and parses a DHCP packet from a file instead of the network."), NULL },
-  { LOPT_DHCP6_FUZZ, ARG_DUP, "<filename>", gettext_noop("Read and parses a DHCPv6 packet from a file instead of the network."), NULL },
-#endif
   { 0, 0, NULL, NULL, NULL }
 }; 
 
@@ -2729,6 +2699,8 @@ static int one_opt(int option, char *arg, char *errstr, char *gen_err, int comma
 		  new->flags |= CONTEXT_RA_ROUTER | CONTEXT_RA;
 		else if (strcmp(a[leasepos], "ra-stateless") == 0)
 		  new->flags |= CONTEXT_RA_STATELESS | CONTEXT_DHCP | CONTEXT_RA;
+		else if (strcmp(a[leasepos], "off-link") == 0)
+		  new->flags |= CONTEXT_RA_OFF_LINK;
 		else if (leasepos == 1 && inet_pton(AF_INET6, a[leasepos], &new->end6))
 		  new->flags |= CONTEXT_DHCP; 
 		else if (strstr(a[leasepos], "constructor:") == a[leasepos])
@@ -3958,44 +3930,6 @@ static int one_opt(int option, char *arg, char *errstr, char *gen_err, int comma
 	break;
       }
 #endif
-
-#if FUZZ
-    case LOPT_FUZZ_CLIENT: /* --client-fuzz */
-      daemon->client_fuzz_file = optarg;
-      break;
-
-    case LOPT_FUZZ_SERVER: /* --server-fuzz */
-      daemon->server_fuzz_file = optarg;
-      break;
-
-    case LOPT_TCP_FUZZ_CLIENT:
-      daemon->tcp_client_fuzz_file = optarg;
-      break;
-
-    case LOPT_TCP_FUZZ_SERVER:
-      daemon->tcp_server_fuzz_file = optarg;
-      break;
-
-    case LOPT_TFTP_FUZZ:
-      daemon->tftp_fuzz_file = optarg;
-      break;
-
-    case LOPT_DHCP_FUZZ:
-      daemon->dhcp_fuzz_file = optarg;
-      break;
-
-    case LOPT_DHCP6_FUZZ:
-      daemon->dhcp6_fuzz_file = optarg;
-      break;
-
-    case LOPT_RANDOM_PORT: /* --randomize-port  */
-      do
-      {
-        daemon->port = rand16();
-      } while(daemon->port < 1024);
-      printf("dns port randomly set to %d\n", daemon->port);
-      break;
-#endif
 		
     default:
       ret_err(_("unsupported option (check that dnsmasq was compiled with DHCP/TFTP/DNSSEC/DBus support)"));
@@ -4566,15 +4500,19 @@ void read_opts(int argc, char **argv, char *compile_opts)
     {
       struct server *tmp;
       for (tmp = daemon->servers; tmp; tmp = tmp->next)
-	if (!(tmp->flags & SERV_HAS_SOURCE))
-	  {
-	    if (tmp->source_addr.sa.sa_family == AF_INET)
-	      tmp->source_addr.in.sin_port = htons(daemon->query_port);
+	{
+	  tmp->edns_pktsz = daemon->edns_pktsz;
+	 
+	  if (!(tmp->flags & SERV_HAS_SOURCE))
+	    {
+	      if (tmp->source_addr.sa.sa_family == AF_INET)
+		tmp->source_addr.in.sin_port = htons(daemon->query_port);
 #ifdef HAVE_IPV6
-	    else if (tmp->source_addr.sa.sa_family == AF_INET6)
-	      tmp->source_addr.in6.sin6_port = htons(daemon->query_port);
+	      else if (tmp->source_addr.sa.sa_family == AF_INET6)
+		tmp->source_addr.in6.sin6_port = htons(daemon->query_port);
 #endif 
-	  } 
+	    }
+	} 
     }
   
   if (daemon->if_addrs)

@@ -504,7 +504,7 @@ struct server {
   char interface[IF_NAMESIZE+1];
   struct serverfd *sfd; 
   char *domain; /* set if this server only handles a domain. */ 
-  int flags, tcpfd;
+  int flags, tcpfd, edns_pktsz;
   unsigned int queries, failed_queries;
 #ifdef HAVE_LOOP
   u32 uid;
@@ -594,6 +594,7 @@ struct hostsfile {
 #define FREC_DO_QUESTION       64
 #define FREC_ADDED_PHEADER    128
 #define FREC_CHECK_NOSIGN     256
+#define FREC_TEST_PKTSZ       512
 
 #ifdef HAVE_DNSSEC
 #define HASH_SIZE 20 /* SHA-1 digest size */
@@ -867,6 +868,7 @@ struct dhcp_context {
 #define CONTEXT_USED           (1u<<15)
 #define CONTEXT_OLD            (1u<<16)
 #define CONTEXT_V6             (1u<<17)
+#define CONTEXT_RA_OFF_LINK    (1u<<18)
 
 struct ping_result {
   struct in_addr addr;
@@ -1054,15 +1056,6 @@ extern struct daemon {
   char *addrbuff;
   char *addrbuff2; /* only allocated when OPT_EXTRALOG */
 
-#ifdef FUZZ
-  char *client_fuzz_file;
-  char *server_fuzz_file;
-  char *tcp_client_fuzz_file;
-  char *tcp_server_fuzz_file;
-  char *tftp_fuzz_file;
-  char *dhcp_fuzz_file;
-  char *dhcp6_fuzz_file;
-#endif
 } *daemon;
 
 /* cache.c */
@@ -1157,7 +1150,7 @@ int in_zone(struct auth_zone *zone, char *name, char **cut);
 #endif
 
 /* dnssec.c */
-size_t dnssec_generate_query(struct dns_header *header, char *end, char *name, int class, int type, union mysockaddr *addr);
+size_t dnssec_generate_query(struct dns_header *header, char *end, char *name, int class, int type, union mysockaddr *addr, int edns_pktsz);
 int dnssec_validate_by_ds(time_t now, struct dns_header *header, size_t n, char *name, char *keyname, int class);
 int dnssec_validate_ds(time_t now, struct dns_header *header, size_t plen, char *name, char *keyname, int class);
 int dnssec_validate_reply(time_t now, struct dns_header *header, size_t plen, char *name, char *keyname, int *class, int *neganswer, int *nons);
